@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +10,11 @@ import jwt
 
 from database import db, create_document, get_documents
 from schemas import Tenant, User, Plan, Subscription, AIService, Usage, CMSPage, Invoice
+
+# Optional provider SDKs (installed via requirements). Import guarded in functions
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_ALGO = "HS256"
@@ -113,8 +118,6 @@ def register(req: RegisterRequest):
     # attach to user
     db["user"].update_one({"_id": db["user"].find_one({"email": req.email})["_id"]}, {"$addToSet": {"tenant_ids": tenant_id}})
     db["user"].update_one({"_id": db["user"].find_one({"email": req.email})["_id"]}, {"$set": {f"roles.{tenant_id}": "owner"}})
-
-    # Email verification would send email here - omitted, can be integrated with a provider later
 
     # Issue token
     token = create_access_token({"sub": user_id, "email": req.email})
@@ -245,22 +248,115 @@ class AIRequest(BaseModel):
     tenant_id: str
     service_key: str
     prompt: str
+    model: Optional[str] = None
+
+
+def _call_provider(service_key: str, prompt: str, override_model: Optional[str] = None) -> Tuple[str, int, int, int, Optional[str]]:
+    """
+    Returns: completion_text, prompt_tokens, completion_tokens, total_tokens, request_id
+    """
+    key = service_key.lower()
+    # ---------------- OpenAI ----------------
+    if key.startswith("openai"):
+        api_key = OPENAI_API_KEY
+        if not api_key:
+            raise RuntimeError("Missing OPENAI_API_KEY")
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            model = override_model or key.split(":", 1)[1] if ":" in key else (override_model or "gpt-4o-mini")
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+            )
+            choice = resp.choices[0]
+            text = choice.message.content or ""
+            usage = resp.usage
+            pt = int(getattr(usage, "prompt_tokens", 0) or 0)
+            ct = int(getattr(usage, "completion_tokens", 0) or 0)
+            tt = int(getattr(usage, "total_tokens", pt + ct))
+            rid = getattr(resp, "id", None)
+            return text, pt, ct, tt, rid
+        except Exception as e:
+            raise RuntimeError(f"OpenAI error: {str(e)[:200]}")
+
+    # ---------------- Anthropic ----------------
+    if key.startswith("anthropic"):
+        api_key = ANTHROPIC_API_KEY
+        if not api_key:
+            raise RuntimeError("Missing ANTHROPIC_API_KEY")
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            model = override_model or key.split(":", 1)[1] if ":" in key else (override_model or "claude-3-5-sonnet-latest")
+            resp = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            # content is list of blocks
+            text = ""
+            if resp.content and len(resp.content) > 0:
+                block = resp.content[0]
+                text = getattr(block, "text", None) or getattr(block, "content", None) or str(block)
+            usage = getattr(resp, "usage", None)
+            pt = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
+            ct = int(getattr(usage, "output_tokens", 0) or 0) if usage else 0
+            tt = int(pt + ct)
+            rid = getattr(resp, "id", None)
+            return text, pt, ct, tt, rid
+        except Exception as e:
+            raise RuntimeError(f"Anthropic error: {str(e)[:200]}")
+
+    # ---------------- Google Gemini ----------------
+    if key.startswith("gemini") or key.startswith("google"):
+        api_key = GEMINI_API_KEY
+        if not api_key:
+            raise RuntimeError("Missing GEMINI_API_KEY")
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            model = override_model or key.split(":", 1)[1] if ":" in key else (override_model or "gemini-1.5-flash")
+            gmodel = genai.GenerativeModel(model)
+            resp = gmodel.generate_content(prompt)
+            text = resp.text or ""
+            # usage metadata may vary by version
+            um = getattr(resp, "usage_metadata", None) or getattr(resp, "usageMetadata", None)
+            pt = int(getattr(um, "prompt_token_count", 0) or getattr(um, "promptTokenCount", 0) or 0) if um else 0
+            ct = int(getattr(um, "candidates_token_count", 0) or getattr(um, "candidatesTokenCount", 0) or 0) if um else 0
+            tt = int(getattr(um, "total_token_count", pt + ct) or getattr(um, "totalTokenCount", pt + ct) or (pt + ct)) if um else (pt + ct)
+            rid = getattr(resp, "id", None)
+            return text, pt, ct, tt, rid
+        except Exception as e:
+            raise RuntimeError(f"Gemini error: {str(e)[:200]}")
+
+    # Unknown provider key
+    raise RuntimeError("Unsupported service key")
 
 
 @app.post("/ai/complete")
 def ai_complete(body: AIRequest, user=Depends(get_current_user)):
-    # Dummy completion that meters tokens; real providers can be added with SDKs and env keys
-    svc = get_documents("aiservice", {"key": body.service_key}, limit=1)
-    if not svc:
+    # Find service config
+    svc_list = get_documents("aiservice", {"key": body.service_key}, limit=1)
+    if not svc_list:
         raise HTTPException(status_code=400, detail="Unknown service")
-    svc = svc[0]
+    svc = svc_list[0]
 
-    # Simple token estimate
-    prompt_tokens = max(1, len(body.prompt.split()) // 0.75)
-    completion_tokens = max(10, min(200, int(len(body.prompt) * 0.6)))
-    total_tokens = int(prompt_tokens + completion_tokens)
+    # Try real provider; on failure, fallback to mocked completion
+    used_provider = "mock"
+    try:
+        text, prompt_tokens, completion_tokens, total_tokens, request_id = _call_provider(body.service_key, body.prompt, body.model)
+        used_provider = "real"
+    except Exception as e:
+        # Fallback to mock if provider missing or error
+        prompt_tokens = max(1, int(len(body.prompt.split()) / 0.75))
+        completion_tokens = max(10, min(200, int(len(body.prompt) * 0.6)))
+        total_tokens = int(prompt_tokens + completion_tokens)
+        request_id = None
+        text = f"This is a mocked completion for service {body.service_key}. Error: {str(e)[:120]}"
 
-    price_per_1k = svc.get("pricing_per_1k_tokens_cents", 100)
+    price_per_1k = float(svc.get("pricing_per_1k_tokens_cents", 100))
     input_mult = float(svc.get("input_multiplier", 1.0))
     output_mult = float(svc.get("output_multiplier", 1.0))
 
@@ -272,20 +368,20 @@ def ai_complete(body: AIRequest, user=Depends(get_current_user)):
         service_key=body.service_key,
         prompt_tokens=int(prompt_tokens),
         completion_tokens=int(completion_tokens),
-        total_tokens=total_tokens,
+        total_tokens=int(total_tokens),
         cost_cents=cost_cents,
-        request_id=None,
+        request_id=request_id,
     )
     create_document("usage", usage)
 
-    completion_text = f"This is a mocked completion for service {body.service_key}. Your prompt had ~{prompt_tokens} tokens."
     return {
-        "completion": completion_text,
+        "completion": text,
         "usage": {
             "prompt_tokens": int(prompt_tokens),
             "completion_tokens": int(completion_tokens),
-            "total_tokens": total_tokens,
+            "total_tokens": int(total_tokens),
             "cost_cents": cost_cents,
+            "mode": used_provider,
         },
     }
 
@@ -397,6 +493,12 @@ def test_database():
             response["database"] = "⚠️ Available but not initialized"
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:80]}"
+    # expose provider presence
+    response["providers"] = {
+        "openai": bool(OPENAI_API_KEY),
+        "anthropic": bool(ANTHROPIC_API_KEY),
+        "gemini": bool(GEMINI_API_KEY),
+    }
     return response
 
 
